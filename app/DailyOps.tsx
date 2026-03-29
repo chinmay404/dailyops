@@ -1,8 +1,10 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { hydrateState, persistState as persistRemoteState } from '../lib/persistence'
 import {
-  getState, saveState, getToday, getTodayLog, updateTodayLog,
+  clearStateCache, createDefaultState, getState, normalizeState, saveState,
+  getToday, getTodayLog, updateTodayLog,
   getLast7Days, getLast30Days, getCurrentStreak, formatDate,
   SECTIONS, AppState, DayLog, Task
 } from '../lib/store'
@@ -11,6 +13,73 @@ import {
 } from 'recharts'
 
 type View = 'today' | 'history' | 'settings'
+type SyncStatus = 'loading' | 'saving' | 'synced' | 'error'
+type TimerMode = 'focus' | 'break'
+
+const TASK_JSON_TEMPLATE = {
+  validSections: SECTIONS,
+  tasks: [
+    { label: 'Morning sunlight', sub: '10 minutes outside before screens', section: 'Morning', icon: '☀️' },
+    { label: 'Pomodoro block', sub: 'One uninterrupted 25-minute session', section: 'Work', icon: '⏱️' },
+    { label: 'Mobility reset', sub: '8 to 10 minutes of stretching', section: 'Movement', icon: '🧘' },
+  ],
+}
+
+function formatTimer(seconds: number) {
+  const minutes = Math.floor(seconds / 60).toString().padStart(2, '0')
+  const remainder = (seconds % 60).toString().padStart(2, '0')
+  return `${minutes}:${remainder}`
+}
+
+function parseTaskJson(raw: string, startingOrder: number): Task[] {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('JSON could not be parsed. Fix the syntax and try again.')
+  }
+
+  const rawTasks =
+    Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { tasks?: unknown }).tasks)
+        ? (parsed as { tasks: unknown[] }).tasks
+        : null
+
+  if (!rawTasks || rawTasks.length === 0) {
+    throw new Error('Use either an array of tasks or an object with a non-empty "tasks" array.')
+  }
+
+  const createdAt = Date.now()
+
+  return rawTasks.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Task ${index + 1} must be an object.`)
+    }
+
+    const task = entry as Record<string, unknown>
+    const label = typeof task.label === 'string' ? task.label.trim() : ''
+    const section = typeof task.section === 'string' && task.section ? task.section : 'Work'
+
+    if (!label) {
+      throw new Error(`Task ${index + 1} needs a label.`)
+    }
+
+    if (!SECTIONS.includes(section)) {
+      throw new Error(`Task ${index + 1} has an invalid section. Use: ${SECTIONS.join(', ')}.`)
+    }
+
+    return {
+      id: `custom_${createdAt}_${index}`,
+      label,
+      sub: typeof task.sub === 'string' ? task.sub : '',
+      icon: typeof task.icon === 'string' && task.icon ? task.icon : '📌',
+      section,
+      order: startingOrder + index,
+    }
+  })
+}
 
 export default function DailyOps() {
   const [state, setState] = useState<AppState | null>(null)
@@ -26,29 +95,120 @@ export default function DailyOps() {
   const [showAddTask, setShowAddTask] = useState(false)
   const [notifTime, setNotifTime] = useState('08:00')
   const [notifGranted, setNotifGranted] = useState(false)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('loading')
+  const [focusMinutes, setFocusMinutes] = useState(25)
+  const [breakMinutes, setBreakMinutes] = useState(5)
+  const [timerMode, setTimerMode] = useState<TimerMode>('focus')
+  const [timerRunning, setTimerRunning] = useState(false)
+  const [secondsLeft, setSecondsLeft] = useState(25 * 60)
+  const [completedPomodoros, setCompletedPomodoros] = useState(0)
+  const [jsonTaskText, setJsonTaskText] = useState('')
+  const [jsonTaskError, setJsonTaskError] = useState('')
+  const saveRequestId = useRef(0)
+  const jsonFileInputRef = useRef<HTMLInputElement | null>(null)
+
+  const applyState = useCallback((nextState: AppState) => {
+    const normalized = normalizeState(nextState)
+    saveState(normalized)
+    setState(normalized)
+    setTodayLog(getTodayLog(normalized))
+    setNotifTime(normalized.notifTime || '08:00')
+  }, [])
 
   useEffect(() => {
-    const s = getState()
-    setState(s)
-    setTodayLog(getTodayLog(s))
-    setNotifTime(s.notifTime || '08:00')
+    const cachedState = getState()
+    applyState(cachedState)
+
     if (typeof Notification !== 'undefined') {
       setNotifGranted(Notification.permission === 'granted')
     }
-  }, [])
 
-  const persist = useCallback((newState: AppState, newLog: DayLog) => {
-    const updated = updateTodayLog(newState, newLog)
-    saveState(updated)
-    setState(updated)
-    setTodayLog(newLog)
-  }, [])
+    let cancelled = false
+
+    const loadState = async () => {
+      const hydrated = await hydrateState()
+      if (cancelled) return
+
+      applyState(hydrated.state)
+      setSyncStatus(hydrated.synced ? 'synced' : 'error')
+    }
+
+    void loadState()
+
+    return () => {
+      cancelled = true
+    }
+  }, [applyState])
+
+  useEffect(() => {
+    if (timerRunning) return
+    setSecondsLeft((timerMode === 'focus' ? focusMinutes : breakMinutes) * 60)
+  }, [timerMode, timerRunning, focusMinutes, breakMinutes])
+
+  useEffect(() => {
+    if (!timerRunning) return
+
+    const intervalId = window.setInterval(() => {
+      setSecondsLeft((current) => {
+        if (current > 1) {
+          return current - 1
+        }
+
+        const nextMode: TimerMode = timerMode === 'focus' ? 'break' : 'focus'
+        const nextSeconds = (nextMode === 'focus' ? focusMinutes : breakMinutes) * 60
+
+        setTimerRunning(false)
+        setTimerMode(nextMode)
+
+        if (timerMode === 'focus') {
+          setCompletedPomodoros((count) => count + 1)
+        }
+
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          new Notification(
+            timerMode === 'focus' ? 'Focus block complete' : 'Break complete',
+            {
+              body: timerMode === 'focus' ? 'Take a short reset.' : 'Time to lock back in.',
+              icon: '/icon-192.png',
+            }
+          )
+        }
+
+        return nextSeconds
+      })
+    }, 1000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [timerRunning, timerMode, focusMinutes, breakMinutes])
+
+  const persistAppState = useCallback(async (nextState: AppState) => {
+    applyState(nextState)
+    setSyncStatus('saving')
+    const requestId = ++saveRequestId.current
+
+    try {
+      const syncedState = await persistRemoteState(nextState)
+      if (requestId !== saveRequestId.current) return
+
+      applyState(syncedState)
+      setSyncStatus('synced')
+    } catch {
+      if (requestId !== saveRequestId.current) return
+      setSyncStatus('error')
+    }
+  }, [applyState])
+
+  const persistTodayLog = useCallback((newState: AppState, newLog: DayLog) => {
+    void persistAppState(updateTodayLog(newState, newLog))
+  }, [persistAppState])
 
   const toggleTask = (taskId: string) => {
     if (!state || !todayLog) return
     const newDone = { ...todayLog.done, [taskId]: !todayLog.done[taskId] }
     const newLog = { ...todayLog, done: newDone }
-    persist(state, newLog)
+    persistTodayLog(state, newLog)
     const total = state.tasks.length
     const doneCount = Object.values(newDone).filter(Boolean).length
     if (doneCount === total) {
@@ -66,7 +226,7 @@ export default function DailyOps() {
   const saveNote = () => {
     if (!state || !todayLog || !activeNote) return
     const newLog = { ...todayLog, notes: { ...todayLog.notes, [activeNote]: noteText } }
-    persist(state, newLog)
+    persistTodayLog(state, newLog)
     setActiveNote(null)
   }
 
@@ -92,9 +252,7 @@ export default function DailyOps() {
 
   const saveNotifTime = () => {
     if (!state) return
-    const newState = { ...state, notifTime }
-    saveState(newState)
-    setState(newState)
+    void persistAppState({ ...state, notifTime })
     scheduleNotif(notifTime)
   }
 
@@ -105,7 +263,7 @@ export default function DailyOps() {
     delete newDone[taskId]
     const newLog = { ...todayLog, done: newDone }
     const newState = { ...state, tasks: newTasks }
-    persist(newState, newLog)
+    persistTodayLog(newState, newLog)
   }
 
   const addTask = () => {
@@ -115,19 +273,60 @@ export default function DailyOps() {
       id, label: newTaskLabel, sub: newTaskSub, icon: '📌',
       section: newTaskSection, order: state.tasks.length
     }
-    const newState = { ...state, tasks: [...state.tasks, task] }
-    saveState(newState)
-    setState(newState)
+    void persistAppState({ ...state, tasks: [...state.tasks, task] })
     setNewTaskLabel(''); setNewTaskSub(''); setShowAddTask(false)
   }
 
   const saveEditTask = () => {
     if (!state || !editingTask) return
     const newTasks = state.tasks.map(t => t.id === editingTask.id ? editingTask : t)
-    const newState = { ...state, tasks: newTasks }
-    saveState(newState)
-    setState(newState)
+    void persistAppState({ ...state, tasks: newTasks })
     setEditingTask(null)
+  }
+
+  const toggleTimer = () => {
+    setTimerRunning((running) => !running)
+  }
+
+  const resetTimer = (mode = timerMode) => {
+    setTimerRunning(false)
+    setTimerMode(mode)
+    setSecondsLeft((mode === 'focus' ? focusMinutes : breakMinutes) * 60)
+  }
+
+  const downloadTaskTemplate = () => {
+    const blob = new Blob([JSON.stringify(TASK_JSON_TEMPLATE, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+
+    link.href = url
+    link.download = 'dailyops-task-template.json'
+    link.click()
+
+    URL.revokeObjectURL(url)
+  }
+
+  const importTasksFromJson = () => {
+    if (!state) return
+
+    try {
+      const importedTasks = parseTaskJson(jsonTaskText, state.tasks.length)
+      setJsonTaskError('')
+      void persistAppState({ ...state, tasks: [...state.tasks, ...importedTasks] })
+      setJsonTaskText('')
+    } catch (error) {
+      setJsonTaskError(error instanceof Error ? error.message : 'Task JSON could not be imported.')
+    }
+  }
+
+  const loadTaskFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    const text = await file.text()
+    setJsonTaskText(text)
+    setJsonTaskError('')
+    event.target.value = ''
   }
 
   if (!state || !todayLog) return (
@@ -141,7 +340,18 @@ export default function DailyOps() {
   const doneCount = Object.values(todayLog.done).filter(Boolean).length
   const pct = total ? Math.round((doneCount / total) * 100) : 0
   const streak = getCurrentStreak(state.logs, total)
-  const today = getToday()
+  const syncLabel = syncStatus === 'loading'
+    ? 'CONNECTING TO CLOUD'
+    : syncStatus === 'saving'
+      ? 'SAVING TO CLOUD'
+      : syncStatus === 'synced'
+        ? 'SYNCED'
+        : 'LOCAL CACHE ONLY'
+  const syncColor = syncStatus === 'synced'
+    ? 'var(--accent)'
+    : syncStatus === 'error'
+      ? 'var(--red)'
+      : 'var(--text-mid)'
 
   return (
     <div style={{ background: 'var(--bg)', minHeight: '100vh', maxWidth: 480, margin: '0 auto', position: 'relative' }}>
@@ -258,6 +468,87 @@ export default function DailyOps() {
         {/* TODAY VIEW */}
         {view === 'today' && (
           <div className="animate-fadein">
+            <div style={{ marginTop: 20, border: '1px solid var(--border)', padding: 16, background: 'var(--surface)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 3 }}>POMODORO TIMER</div>
+                <div style={{ fontFamily: 'Space Mono', fontSize: 8, color: 'var(--accent)', letterSpacing: 2 }}>{completedPomodoros} FOCUS BLOCKS</div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                {(['focus', 'break'] as TimerMode[]).map(mode => (
+                  <button key={mode} onClick={() => resetTimer(mode)} style={{
+                    flex: 1,
+                    background: timerMode === mode ? 'var(--accent)' : 'transparent',
+                    color: timerMode === mode ? '#000' : 'var(--text-dim)',
+                    border: `1px solid ${timerMode === mode ? 'var(--accent)' : 'var(--border)'}`,
+                    fontFamily: 'Space Mono',
+                    fontSize: 9,
+                    letterSpacing: 2,
+                    padding: '8px 10px',
+                    cursor: 'pointer',
+                    textTransform: 'uppercase'
+                  }}>
+                    {mode}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontFamily: 'Bebas Neue', fontSize: 72, lineHeight: 1, letterSpacing: 3, color: timerMode === 'focus' ? 'var(--accent)' : 'var(--text)' }}>
+                {formatTimer(secondsLeft)}
+              </div>
+              <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 2, marginTop: 4, marginBottom: 14 }}>
+                {timerMode === 'focus' ? 'LOCK IN FOR ONE CLEAR BLOCK' : 'RESET BEFORE THE NEXT PUSH'}
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                <button onClick={toggleTimer} style={{
+                  flex: 1,
+                  background: 'var(--accent)',
+                  color: '#000',
+                  border: 'none',
+                  fontFamily: 'Space Mono',
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  padding: '10px 12px',
+                  cursor: 'pointer'
+                }}>
+                  {timerRunning ? 'PAUSE' : 'START'}
+                </button>
+                <button onClick={() => resetTimer()} style={{
+                  flex: 1,
+                  background: 'transparent',
+                  color: 'var(--text-dim)',
+                  border: '1px solid var(--border)',
+                  fontFamily: 'Space Mono',
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  padding: '10px 12px',
+                  cursor: 'pointer'
+                }}>
+                  RESET
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <label style={{ flex: 1 }}>
+                  <div style={{ fontFamily: 'Space Mono', fontSize: 8, color: 'var(--text-dim)', letterSpacing: 2, marginBottom: 6 }}>FOCUS MIN</div>
+                  <input
+                    type="number"
+                    min={1}
+                    value={focusMinutes}
+                    onChange={e => setFocusMinutes(Math.max(1, Number.parseInt(e.target.value || '25', 10) || 25))}
+                    style={{ width: '100%', background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', padding: '8px 10px', fontFamily: 'Space Mono', fontSize: 13, outline: 'none' }}
+                  />
+                </label>
+                <label style={{ flex: 1 }}>
+                  <div style={{ fontFamily: 'Space Mono', fontSize: 8, color: 'var(--text-dim)', letterSpacing: 2, marginBottom: 6 }}>BREAK MIN</div>
+                  <input
+                    type="number"
+                    min={1}
+                    value={breakMinutes}
+                    onChange={e => setBreakMinutes(Math.max(1, Number.parseInt(e.target.value || '5', 10) || 5))}
+                    style={{ width: '100%', background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', padding: '8px 10px', fontFamily: 'Space Mono', fontSize: 13, outline: 'none' }}
+                  />
+                </label>
+              </div>
+            </div>
+
             {/* Yesterday's failures */}
             <YesterdayFailures state={state} />
 
@@ -333,6 +624,12 @@ export default function DailyOps() {
         {/* SETTINGS VIEW */}
         {view === 'settings' && (
           <div className="animate-fadein" style={{ marginTop: 28 }}>
+            <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 3, marginBottom: 16 }}>PERSISTENCE</div>
+            <div style={{ border: '1px solid var(--border)', padding: 16, background: 'var(--surface)', marginBottom: 12 }}>
+              <div style={{ fontSize: 13, color: 'var(--text-mid)', marginBottom: 10 }}>State is cached locally and synced to your Supabase database.</div>
+              <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: syncColor, letterSpacing: 2 }}>{syncLabel}</div>
+            </div>
+
             <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 3, marginBottom: 16 }}>NOTIFICATIONS</div>
             <div style={{ border: '1px solid var(--border)', padding: 16, background: 'var(--surface)', marginBottom: 12 }}>
               <div style={{ fontSize: 13, color: 'var(--text-mid)', marginBottom: 12 }}>Daily reminder to open your tracker</div>
@@ -350,19 +647,66 @@ export default function DailyOps() {
               )}
             </div>
 
+            <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 3, marginBottom: 16, marginTop: 28 }}>TASK JSON</div>
+            <div style={{ border: '1px solid var(--border)', padding: 16, background: 'var(--surface)', marginBottom: 12 }}>
+              <div style={{ fontSize: 13, color: 'var(--text-mid)', marginBottom: 12 }}>
+                Paste task JSON to append custom tasks, or download the ideal template and fill it in offline.
+              </div>
+              <textarea
+                value={jsonTaskText}
+                onChange={e => setJsonTaskText(e.target.value)}
+                placeholder={JSON.stringify(TASK_JSON_TEMPLATE, null, 2)}
+                rows={10}
+                style={{
+                  width: '100%',
+                  background: 'var(--bg)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text)',
+                  padding: 12,
+                  fontFamily: 'Space Mono',
+                  fontSize: 11,
+                  resize: 'vertical',
+                  outline: 'none',
+                  marginBottom: 10
+                }}
+              />
+              {jsonTaskError && (
+                <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 10 }}>{jsonTaskError}</div>
+              )}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button onClick={importTasksFromJson} style={{ background: 'var(--accent)', color: '#000', border: 'none', fontFamily: 'Space Mono', fontSize: 9, padding: '9px 12px', cursor: 'pointer', letterSpacing: 2 }}>
+                  IMPORT JSON
+                </button>
+                <button onClick={downloadTaskTemplate} style={{ background: 'transparent', color: 'var(--text)', border: '1px solid var(--border)', fontFamily: 'Space Mono', fontSize: 9, padding: '9px 12px', cursor: 'pointer', letterSpacing: 2 }}>
+                  DOWNLOAD IDEAL JSON
+                </button>
+                <button onClick={() => jsonFileInputRef.current?.click()} style={{ background: 'transparent', color: 'var(--text)', border: '1px solid var(--border)', fontFamily: 'Space Mono', fontSize: 9, padding: '9px 12px', cursor: 'pointer', letterSpacing: 2 }}>
+                  LOAD JSON FILE
+                </button>
+              </div>
+              <input
+                ref={jsonFileInputRef}
+                type="file"
+                accept="application/json"
+                onChange={loadTaskFile}
+                style={{ display: 'none' }}
+              />
+            </div>
+
             <div style={{ fontFamily: 'Space Mono', fontSize: 9, color: 'var(--text-dim)', letterSpacing: 3, marginBottom: 16, marginTop: 28 }}>DANGER ZONE</div>
             <button onClick={() => {
               if (confirm('Reset TODAY only? History stays.')) {
                 if (!state || !todayLog) return
                 const newLog = { ...todayLog, done: {}, notes: {} }
-                persist(state, newLog)
+                persistTodayLog(state, newLog)
               }
             }} style={{ width: '100%', background: 'transparent', border: '1px solid #ff3b3b33', color: 'var(--red)', fontFamily: 'Space Mono', fontSize: 9, padding: 10, cursor: 'pointer', letterSpacing: 2, marginBottom: 8 }}>
               RESET TODAY
             </button>
             <button onClick={() => {
               if (confirm('Nuke ALL data? Cannot undo.')) {
-                localStorage.clear(); window.location.reload()
+                clearStateCache()
+                void persistAppState(createDefaultState())
               }
             }} style={{ width: '100%', background: '#ff3b3b11', border: '1px solid var(--red)', color: 'var(--red)', fontFamily: 'Space Mono', fontSize: 9, padding: 10, cursor: 'pointer', letterSpacing: 2 }}>
               RESET ALL DATA
